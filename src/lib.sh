@@ -2,10 +2,14 @@
 
 # Bash strict mode
 set -eo pipefail
-trap 's=$?; echo >&2 "$0: Error on line "$LINENO": $BASH_COMMAND"; exit $s' ERR
 
-# Constants
-readonly SCRIPTY_VERSION="1.0.1"
+# Generate stacktrace on error
+function runtime::stacktrace {
+  local exit_code=$?
+  echo >&2 "$0: Error on line '${LINENO}': ${BASH_COMMAND}"
+  exit ${exit_code}
+}
+trap runtime::stacktrace ERR
 
 # Found current script directory
 RELATIVE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
@@ -18,16 +22,16 @@ BASE_PROJECT="$(dirname "${RELATIVE_DIR}")"
 # Globals:
 #   DISABLE_CONSOLE_COLORS
 # Arguments:
-#   ${@}: Any texts.
+#   ${*}: Any texts.
 # Outputs:
 #   Log a message as action.
 #######################################
 function log::action {
   local disable_console_colors; disable_console_colors=$(env::get_or_empty "DISABLE_CONSOLE_COLORS")
   if [ -z "${disable_console_colors}" ]; then
-    echo -e "\033[33m⇒\033[0m ${@}"
+    echo -e "\033[33m⇒\033[0m ${*}"
   else
-    echo -e "${@}"
+    echo -e "${*}"
   fi
 }
 
@@ -36,16 +40,16 @@ function log::action {
 # Globals:
 #   DISABLE_CONSOLE_COLORS
 # Arguments:
-#   ${@}: Any texts.
+#   ${*}: Any texts.
 # Outputs:
 #   Log a message as failure.
 #######################################
 function log::failure {
   local disable_console_colors; disable_console_colors=$(env::get_or_empty "DISABLE_CONSOLE_COLORS")
   if [ -z "${disable_console_colors}" ]; then
-    echo -e "\033[31m✗\033[0m Failed to ${@}" >&2
+    echo -e "\033[31m✗\033[0m Failed to ${*}" >&2
   else
-    echo -e "Failed to ${@}" >&2
+    echo -e "Failed to ${*}" >&2
   fi
 }
 
@@ -54,28 +58,29 @@ function log::failure {
 # Globals:
 #   DISABLE_CONSOLE_COLORS
 # Arguments:
-#   ${@}: Any texts.
+#   ${*}: Any texts.
 # Outputs:
 #   Log a message as success.
 #######################################
 function log::success {
   local disable_console_colors; disable_console_colors=$(env::get_or_empty "DISABLE_CONSOLE_COLORS")
   if [ -z "${disable_console_colors}" ]; then
-    echo -e "\033[32m✓\033[0m Succeeded to ${@}"
+    echo -e "\033[32m✓\033[0m Succeeded to ${*}"
   else
-    echo -e "Succeeded to ${@}"
+    echo -e "Succeeded to ${*}"
   fi
 }
 
 #######################################
-# Print a variable in hex.
+# Raise an error and exit.
 # Arguments:
-#   ${1}: Variable to print in hex.
-# Outputs:
-#   Hex representation.
+#   ${1}: Any textual reason.
+# Returns:
+#   Always exit 1.
 #######################################
-function helper::print_to_hex {
-  printf "%s" "${1}" | hexdump -C
+function log::fatal {
+  log::failure "${@}"
+  exit 1
 }
 
 #######################################
@@ -88,23 +93,23 @@ function helper::print_to_hex {
 # Returns:
 #   Exit status of the command executed.
 #######################################
-function helper::exec {
+function runtime::exec {
   local silent_stdout; silent_stdout=$(env::get_or_empty "SILENT_STDOUT")
   local silent_stderr; silent_stderr=$(env::get_or_empty "SILENT_STDERR")
-  local err_exit_ctx=$(shopt -o errexit)
+  local err_exit_ctx; err_exit_ctx=$(shopt -o errexit || true)
 
   set +e
   if [ -z "${silent_stdout}" ] && [ -z "${silent_stderr}" ]; then
     "${@}"
-  elif [ ! -z "${silent_stdout}" ] && [ ! -z "${silent_stderr}" ]; then
+  elif [ -n "${silent_stdout}" ] && [ -n "${silent_stderr}" ]; then
     "${@}" &> /dev/null
-  elif [ -z "${silent_stdout}" ] && [ ! -z "${silent_stderr}" ]; then
+  elif [ -z "${silent_stdout}" ] && [ -n "${silent_stderr}" ]; then
     "${@}" 2> /dev/null
   else
     "${@}" > /dev/null
   fi
   local status=$?
-  if [ $(echo "${err_exit_ctx}" | grep "on") ]; then
+  if echo "${err_exit_ctx}" | grep "on"; then
     set -e
   fi
   return ${status}
@@ -121,15 +126,16 @@ function helper::exec {
 # Returns:
 #   Exit status of the command executed.
 #######################################
-function helper::try {
-  helper::exec ${@:2}
+function runtime::try {
+  # shellcheck disable=SC2068
+  runtime::exec ${@:2}
   local status=$?
   if [ ${status} -eq 0 ]; then
     log::success "${1}"
   else
     log::failure "${1}"
     local catch_error; catch_error=$(env::get_or_empty "CATCH_ERROR")
-    if [ ${status} -ne 0 ] && [ ! -z "${catch_error}" ]; then
+    if [ ${status} -ne 0 ] && [ -n "${catch_error}" ]; then
       return 0
     else
       exit ${status}
@@ -146,26 +152,15 @@ function helper::try {
 # Returns:
 #   Exit status of the command executed.
 #######################################
-function helper::propagate_error {
-  SILENT_STDOUT="true" helper::exec ${@:2}
+function runtime::propagate_error {
+  # shellcheck disable=SC2068
+  SILENT_STDOUT="true" runtime::exec ${@:2}
   local status=$?
   if [ ${status} -ne 0 ]; then
     log::failure "${1}"
     exit ${status}
   fi
   return 0
-}
-
-#######################################
-# Raise an error and exit.
-# Arguments:
-#   ${1}: Any textual reason.
-# Returns:
-#   Always exit 1.
-#######################################
-function helper::raise_error {
-  log::failure "$@"
-  exit 1
 }
 
 #######################################
@@ -176,16 +171,16 @@ function helper::raise_error {
 #   0 if the command is present.
 #   1 otherwise.
 #######################################
-function helper::commands_are_present {
+function runtime::commands_are_present {
   for cmd in "${@}"; do
     if ! [ -x "$(command -v "${cmd}")" ]; then
-      helper::raise_error "locate command '${cmd}'"
+      log::fatal "locate command '${cmd}'"
     fi
   done
 }
 
 #######################################
-# Retrive an environment variable.
+# Retrieve an environment variable.
 # Arguments:
 #   ${1}: Environment variable to get.
 # Outputs:
@@ -197,13 +192,13 @@ function helper::commands_are_present {
 function env::get {
   local var; var=$(printf '%s\n' "${!1}")
   if [ -z "${var}" ]; then
-    helper::raise_error "retrieve environment '${1}' variable"
+    log::fatal "retrieve environment '${1}' variable"
   fi
   echo -e "${var}"
 }
 
 #######################################
-# Retrive an environment variable or return default value.
+# Retrieve an environment variable or return default value.
 # Arguments:
 #   ${1}: Environment variable to get.
 #   ${2}: Default value.
@@ -220,7 +215,7 @@ function env::get_or_default {
 }
 
 #######################################
-# Retrive an environment variable or return empty value.
+# Retrieve an environment variable or return empty value.
 # Arguments:
 #   ${1}: Environment variable to get.
 # Outputs:
@@ -231,13 +226,13 @@ function env::get_or_empty {
 }
 
 #######################################
-# Retrive an environment variable or return readed value.
+# Retrieve an environment variable or return read value.
 # Arguments:
 #   ${1}: Environment variable to get.
 # Outputs:
-#   Environment variable value or readed value.
+#   Environment variable value or read value.
 # Returns:
-#   0 if the environment variable is present or readed.
+#   0 if the environment variable is present or read.
 #   1 otherwise.
 #######################################
 function env::get_or_read {
@@ -254,7 +249,18 @@ function env::get_or_read {
 #   Random char sequence containing alphanumeric.
 #######################################
 function str::random {
-  cat /dev/urandom | env LC_ALL="C.UTF-8" LANG="C.UTF-8" LC_CTYPE="C" tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1
+  < /dev/urandom env LC_ALL="C.UTF-8" LANG="C.UTF-8" LC_CTYPE="C" tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1
+}
+
+#######################################
+# Print a variable in hex.
+# Arguments:
+#   ${1}: Variable to print in hex.
+# Outputs:
+#   Hex representation.
+#######################################
+function str::print_to_hex {
+  printf "%s" "${1}" | hexdump -C
 }
 
 log::action "The script you are running has basename $(basename "${0}"), dirname $(dirname "${0}")"
